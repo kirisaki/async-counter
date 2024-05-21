@@ -22,20 +22,20 @@ const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
 
 #[derive(Message)]
 #[rtype(result = "()")]
-pub struct Message(pub String);
+pub struct Update(pub Domino);
 
 #[derive(Message)]
 #[rtype(Domino)]
-pub struct Topple;
+pub struct Topple(pub usize);
 
 #[derive(Message)]
 #[rtype(Domino)]
-pub struct Setup;
+pub struct Setup(pub usize);
 
 #[derive(Message)]
 #[rtype(usize)]
 pub struct Connect {
-    pub addr: Recipient<Message>,
+    pub addr: Recipient<Update>,
 }
 
 #[derive(Message)]
@@ -51,7 +51,7 @@ pub struct Domino {
 }
 
 pub struct DominoServer {
-    sessions: HashMap<usize, Recipient<Message>>,
+    sessions: HashMap<usize, Recipient<Update>>,
     rng: ThreadRng,
     domino_count: Arc<AtomicUsize>,
     high: Arc<AtomicUsize>,
@@ -64,6 +64,15 @@ impl DominoServer {
             rng: rand::thread_rng(),
             domino_count,
             high,
+        }
+    }
+
+    pub fn send_update(&self) {
+        for (_id, addr) in self.sessions.clone().into_iter() {
+            addr.do_send(Update(Domino {
+                domino: self.domino_count.load(Ordering::SeqCst),
+                high: self.high.load(Ordering::SeqCst),
+            }));
         }
     }
 }
@@ -80,6 +89,7 @@ impl Handler<Connect> for DominoServer {
 
         let id = self.rng.gen::<usize>();
         self.sessions.insert(id, msg.addr);
+        self.send_update();
 
         id
     }
@@ -105,8 +115,9 @@ impl Handler<Setup> for DominoServer {
             self.high.store(domino, Ordering::SeqCst);
             high = domino;
         }
-
-        Domino { domino, high }
+        let new_status = Domino { domino, high };
+        self.send_update();
+        new_status
     }
 }
 
@@ -115,10 +126,12 @@ impl Handler<Topple> for DominoServer {
 
     fn handle(&mut self, _msg: Topple, _ctx: &mut Self::Context) -> Self::Result {
         self.domino_count.store(0, Ordering::SeqCst);
-        Domino {
+        let new_status = Domino {
             domino: self.domino_count.load(Ordering::SeqCst),
             high: self.high.load(Ordering::SeqCst),
-        }
+        };
+        self.send_update();
+        new_status
     }
 }
 
@@ -147,6 +160,34 @@ impl Actor for WsSession {
 
     fn started(&mut self, ctx: &mut Self::Context) {
         self.hb(ctx);
+
+        let addr = ctx.address();
+        self.addr
+            .send(Connect {
+                addr: addr.recipient(),
+            })
+            .into_actor(self)
+            .then(|res, act, ctx| {
+                match res {
+                    Ok(r) => act.id = r,
+                    _ => ctx.stop(),
+                }
+                fut::ready(())
+            })
+            .wait(ctx);
+    }
+
+    fn stopping(&mut self, _ctx: &mut Self::Context) -> Running {
+        self.addr.do_send(Disconnect { id: self.id });
+        Running::Stop
+    }
+}
+
+impl Handler<Update> for WsSession {
+    type Result = ();
+
+    fn handle(&mut self, msg: Update, ctx: &mut Self::Context) -> Self::Result {
+        ctx.text(serde_json::to_string(&msg.0).unwrap())
     }
 }
 
@@ -165,16 +206,17 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsSession {
             Ok(ws::Message::Text(text)) => {
                 if text.starts_with("setup") {
                     self.addr
-                        .send(Setup)
+                        .send(Setup(self.id))
                         .into_actor(self)
-                        .then(|res, _, ctx| {
+                        .then(|res, _msg, ctx| {
                             ctx.text(serde_json::to_string(&res.unwrap()).unwrap());
+
                             fut::ready(())
                         })
                         .wait(ctx)
                 } else if text.starts_with("topple") {
                     self.addr
-                        .send(Topple)
+                        .send(Topple(self.id))
                         .into_actor(self)
                         .then(|res, _, ctx| {
                             ctx.text(serde_json::to_string(&res.unwrap()).unwrap());
