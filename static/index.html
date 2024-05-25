@@ -3,7 +3,7 @@
 
 <head>
   <meta charset="utf-8" />
-  <title>Websocket Echo</title>
+  <title>Domino Toppling</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Josefin+Sans:ital,wght@0,100..700;1,100..700&display=swap"
@@ -79,7 +79,8 @@
     const $toppleButton = document.querySelector('#topple');
 
     var socket = null;
-
+    var state = new Object();
+    var id = 0;
 
     function connect() {
       disconnect();
@@ -98,8 +99,9 @@
       socket.onmessage = (ev) => {
         console.log(ev.data);
         const msg = JSON.parse(ev.data);
-        $domino.textContent = msg.domino.toString();
-        $highscore.textContent = msg.high.toString();
+        id = Number(msg.id);
+        setDomino(msg.domino);
+        setHigh(msg.high);
       }
 
       socket.onclose = () => {
@@ -131,6 +133,16 @@
       }
     }
 
+    function setDomino(n) {
+      state.domino = n;
+      $domino.textContent = n.toString();
+    }
+
+    function setHigh(n) {
+      state.high = n;
+      $highscore.textContent = n.toString();
+    }
+
     $connectButton.addEventListener('click', () => {
       if (socket) {
         disconnect();
@@ -142,13 +154,19 @@
     })
 
     $setupButton.addEventListener('click', () => {
-      socket.send('setup');
+      const domino = state.domino + 1;
+      const high = state.high < domino ? domino : state.high;
+
+      socket.send(JSON.stringify({ id, domino, high }));
     })
 
     $toppleButton.addEventListener('click', () => {
-      socket.send('topple');
-
+      setDomino(0);
+      socket.send(JSON.stringify({ domino: state.domino, high: state.high, id }));
     })
+
+    setDomino(0);
+    setHigh(0);
     updateConnectionStatus();
   </script>
 </body>

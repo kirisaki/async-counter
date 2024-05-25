@@ -1,7 +1,6 @@
 use std::{
     collections::HashMap,
-    sync::atomic::Ordering,
-    sync::{atomic::AtomicUsize, Arc},
+    sync::Arc,
     time::{Duration, Instant},
 };
 
@@ -10,7 +9,8 @@ use actix_files::NamedFile;
 use actix_web::{middleware, web, App, Error, HttpRequest, HttpResponse, HttpServer, Responder};
 use actix_web_actors::ws;
 use rand::{rngs::ThreadRng, Rng};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use yrs::{Doc, Map, ReadTxn, Transact};
 
 async fn index() -> impl Responder {
     NamedFile::open_async("./static/index.html").await.unwrap()
@@ -20,22 +20,17 @@ const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
 
 const CLIENT_TIMEOUT: Duration = Duration::from_secs(10);
 
-#[derive(Message)]
+#[derive(Message, Debug)]
 #[rtype(result = "()")]
-pub struct Update(pub Domino);
-
-#[derive(Message)]
-#[rtype(Domino)]
-pub struct Topple(pub usize);
-
-#[derive(Message)]
-#[rtype(Domino)]
-pub struct Setup(pub usize);
+pub struct UpdateRequest {
+    pub state: Domino,
+    pub id: usize,
+}
 
 #[derive(Message)]
 #[rtype(usize)]
 pub struct Connect {
-    pub addr: Recipient<Update>,
+    pub addr: Recipient<UpdateRequest>,
 }
 
 #[derive(Message)]
@@ -44,35 +39,43 @@ pub struct Disconnect {
     pub id: usize,
 }
 
-#[derive(Debug, Clone, Serialize, MessageResponse)]
+// game state
+#[derive(Debug, Clone, Serialize, Deserialize, MessageResponse)]
 pub struct Domino {
-    domino: usize,
-    high: usize,
+    id: usize,
+    domino: i64,
+    high: i64,
 }
 
+// definitions of server
 pub struct DominoServer {
-    sessions: HashMap<usize, Recipient<Update>>,
+    sessions: HashMap<usize, Recipient<UpdateRequest>>,
     rng: ThreadRng,
-    domino_count: Arc<AtomicUsize>,
-    high: Arc<AtomicUsize>,
+    state: Arc<Doc>,
 }
 
 impl DominoServer {
-    pub fn new(domino_count: Arc<AtomicUsize>, high: Arc<AtomicUsize>) -> Self {
+    pub fn new(state: Arc<Doc>) -> Self {
         DominoServer {
             sessions: HashMap::new(),
             rng: rand::thread_rng(),
-            domino_count,
-            high,
+            state,
         }
     }
 
     pub fn send_update(&self) {
-        for (_id, addr) in self.sessions.clone().into_iter() {
-            addr.do_send(Update(Domino {
-                domino: self.domino_count.load(Ordering::SeqCst),
-                high: self.high.load(Ordering::SeqCst),
-            }));
+        for (id, recp) in self.sessions.clone().into_iter() {
+            let doc = self.state.clone();
+            let txn = doc.transact();
+            let map = txn.get_map("state").unwrap();
+            recp.do_send(UpdateRequest {
+                id,
+                state: Domino {
+                    id,
+                    domino: map.get(&txn, "domino").unwrap().try_into().unwrap(),
+                    high: map.get(&txn, "high").unwrap().try_into().unwrap(),
+                },
+            });
         }
     }
 }
@@ -105,36 +108,22 @@ impl Handler<Disconnect> for DominoServer {
     }
 }
 
-impl Handler<Setup> for DominoServer {
-    type Result = Domino;
+impl Handler<UpdateRequest> for DominoServer {
+    type Result = ();
 
-    fn handle(&mut self, _msg: Setup, _ctx: &mut Self::Context) -> Self::Result {
-        let domino = self.domino_count.fetch_add(1, Ordering::SeqCst) + 1;
-        let mut high = self.high.load(Ordering::SeqCst);
-        if high < domino {
-            self.high.store(domino, Ordering::SeqCst);
-            high = domino;
+    fn handle(&mut self, msg: UpdateRequest, _ctx: &mut Self::Context) -> Self::Result {
+        {
+            let root_doc = self.state.clone();
+            let map = root_doc.get_or_insert_map("state");
+            let mut root_txn = root_doc.transact_mut();
+            map.insert(&mut root_txn, "domino", msg.state.domino);
+            map.insert(&mut root_txn, "high", msg.state.high);
         }
-        let new_status = Domino { domino, high };
         self.send_update();
-        new_status
     }
 }
 
-impl Handler<Topple> for DominoServer {
-    type Result = Domino;
-
-    fn handle(&mut self, _msg: Topple, _ctx: &mut Self::Context) -> Self::Result {
-        self.domino_count.store(0, Ordering::SeqCst);
-        let new_status = Domino {
-            domino: self.domino_count.load(Ordering::SeqCst),
-            high: self.high.load(Ordering::SeqCst),
-        };
-        self.send_update();
-        new_status
-    }
-}
-
+// definitions of session
 pub struct WsSession {
     pub id: usize,
     pub hb: Instant,
@@ -159,6 +148,7 @@ impl Actor for WsSession {
     type Context = ws::WebsocketContext<Self>;
 
     fn started(&mut self, ctx: &mut Self::Context) {
+        println!("start session");
         self.hb(ctx);
 
         let addr = ctx.address();
@@ -183,18 +173,17 @@ impl Actor for WsSession {
     }
 }
 
-impl Handler<Update> for WsSession {
+impl Handler<UpdateRequest> for WsSession {
     type Result = ();
 
-    fn handle(&mut self, msg: Update, ctx: &mut Self::Context) -> Self::Result {
-        ctx.text(serde_json::to_string(&msg.0).unwrap())
+    fn handle(&mut self, msg: UpdateRequest, ctx: &mut Self::Context) -> Self::Result {
+        ctx.text(serde_json::to_string(&msg.state).unwrap());
     }
 }
 
 impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsSession {
     fn handle(&mut self, msg: Result<ws::Message, ws::ProtocolError>, ctx: &mut Self::Context) {
-        // process websocket messages
-        println!("WS: {msg:?}");
+        println!("WS: {:?}", msg);
         match msg {
             Ok(ws::Message::Ping(msg)) => {
                 self.hb = Instant::now();
@@ -204,26 +193,9 @@ impl StreamHandler<Result<ws::Message, ws::ProtocolError>> for WsSession {
                 self.hb = Instant::now();
             }
             Ok(ws::Message::Text(text)) => {
-                if text.starts_with("setup") {
-                    self.addr
-                        .send(Setup(self.id))
-                        .into_actor(self)
-                        .then(|res, _msg, ctx| {
-                            ctx.text(serde_json::to_string(&res.unwrap()).unwrap());
-
-                            fut::ready(())
-                        })
-                        .wait(ctx)
-                } else if text.starts_with("topple") {
-                    self.addr
-                        .send(Topple(self.id))
-                        .into_actor(self)
-                        .then(|res, _, ctx| {
-                            ctx.text(serde_json::to_string(&res.unwrap()).unwrap());
-                            fut::ready(())
-                        })
-                        .wait(ctx)
-                }
+                let state: Domino = serde_json::from_str(&text).unwrap();
+                println!("{:?}", state);
+                self.addr.do_send(UpdateRequest { id: self.id, state });
             }
             Ok(ws::Message::Binary(bin)) => ctx.binary(bin),
             Ok(ws::Message::Close(reason)) => {
@@ -256,14 +228,19 @@ async fn main() -> std::io::Result<()> {
     env_logger::init_from_env(env_logger::Env::new().default_filter_or("info"));
     log::info!("starting HTTP server at http://localhost:8080");
 
-    let domino_count = Arc::new(AtomicUsize::new(0));
-    let high = Arc::new(AtomicUsize::new(0));
-    let server = DominoServer::new(domino_count.clone(), high.clone()).start();
+    // prepare the root of document
+    let root_doc = Arc::new(Doc::new());
+    {
+        let doc = root_doc.clone();
+        let map = doc.get_or_insert_map("state");
+        let mut txn = doc.transact_mut();
+        map.insert(&mut txn, "domino", 0);
+        map.insert(&mut txn, "high", 0);
+    } // transaction is committed automatically when it is dropped
+    let server = DominoServer::new(root_doc.clone()).start();
 
     HttpServer::new(move || {
         App::new()
-            .app_data(web::Data::from(domino_count.clone()))
-            .app_data(web::Data::from(high.clone()))
             .app_data(web::Data::new(server.clone()))
             .service(web::resource("/").to(index))
             .service(web::resource("/ws").route(web::get().to(domino_route)))
